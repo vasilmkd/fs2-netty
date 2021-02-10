@@ -18,7 +18,7 @@ package fs2
 package netty
 
 import cats.{Applicative, Functor}
-import cats.effect.{Async, Poll, Sync}
+import cats.effect.{Async, Poll, Resource, Sync}
 import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all._
 
@@ -41,25 +41,22 @@ private final class SocketHandler[F[_]: Async] (
   val remoteAddress: F[SocketAddress[IpAddress]] =
     Sync[F].delay(SocketAddress.fromInetSocketAddress(channel.remoteAddress()))
 
-  private[this] def take(poll: Poll[F]): F[ByteBuf] =
+  private[this] def take(poll: Poll[F]): F[Chunk[Byte]] =
     poll(bufs.take) flatMap {
       case null => Applicative[F].pure(null)   // EOF marker
-      case buf: ByteBuf => buf.pure[F]
-      case t: Throwable => t.raiseError[F, ByteBuf]
+      case buf: Chunk[_] => buf.asInstanceOf[Chunk[Byte]].pure[F]
+      case t: Throwable => t.raiseError[F, Chunk[Byte]]
     }
 
-  private[this] val fetch: Stream[F, ByteBuf] =
-    Stream.bracketFull[F, ByteBuf](poll => Sync[F].delay(channel.read()) *> take(poll)) { (b, _) =>
-      if (b != null)
-        Sync[F].delay(b.release()).void
-      else
+  private[this] val fetch: Stream[F, Chunk[Byte]] =
+    Stream.bracketFull[F, Chunk[Byte]](poll => Sync[F].delay(channel.read()) *> take(poll)) { (_, _) =>
         Applicative[F].unit
     }
 
   lazy val reads: Stream[F, Byte] =
     Stream force {
       Functor[F].ifF(isOpen)(
-        fetch.flatMap(b => if (b == null) Stream.empty else Stream.chunk(toChunk(b))) ++ reads,
+        fetch.flatMap(b => if (b == null) Stream.empty else Stream.chunk(b)) ++ reads,
         Stream.empty)
     }
 
@@ -73,7 +70,16 @@ private final class SocketHandler[F[_]: Async] (
     Sync[F].delay(channel.isOpen())
 
   override def channelRead(ctx: ChannelHandlerContext, msg: AnyRef) =
-    disp.unsafeRunAndForget(bufs.offer(msg))
+    disp.unsafeRunAndForget {
+      Sync[F].delay {
+        msg match {
+          case b: ByteBuf =>
+            val next = toChunk(b)
+            b.release()
+            next
+        }
+      }.flatMap(bufs.offer)
+    }
 
   override def exceptionCaught(ctx: ChannelHandlerContext, t: Throwable) =
     disp.unsafeRunAndForget(bufs.offer(t))
